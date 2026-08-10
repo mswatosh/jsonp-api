@@ -19,6 +19,7 @@
  */
 module jakarta.json {
     requires java.logging;
+    requires jdk.incubator.json;
     exports jakarta.json;
     exports jakarta.json.spi;
     exports jakarta.json.stream;

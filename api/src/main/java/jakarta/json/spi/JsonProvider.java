@@ -24,10 +24,12 @@ import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Collection;
+import java.lang.ref.WeakReference;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
+import java.util.WeakHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -80,6 +82,19 @@ public abstract class JsonProvider {
     private static final Logger LOG = Logger.getLogger(JsonProvider.class.getName());
 
     /**
+     * Cache of discovered providers keyed by the context classloader. Weak keys allow the entry
+     * to be GC'd when the classloader is no longer reachable. Weak values break the strong
+     * reference cycle that would otherwise exist because a {@code JsonProvider} instance holds a
+     * strong reference back to its loading classloader (via its {@code Class}), which would
+     * otherwise prevent the weak key from ever being collected.
+     *
+     * <p>All accesses are guarded by explicit {@code synchronized (CLASSLOADER_CACHE)} blocks in
+     * {@link #provider()}.
+     */
+    private static final Map<ClassLoader, WeakReference<JsonProvider>> CLASSLOADER_CACHE =
+            new WeakHashMap<>();
+
+    /**
      * Default constructor.
      */
     protected JsonProvider() {
@@ -88,34 +103,55 @@ public abstract class JsonProvider {
     /**
      * Creates a JSON provider object.
      *
-     * Implementation discovery consists of following steps:
+     * <p>Implementation discovery consists of following steps:
      * <ol>
      * <li>If the system property {@value #JSONP_PROVIDER_FACTORY} exists,
      *    then its value is assumed to be the provider factory class.
-     *    This phase of the look up enables per-JVM override of the JsonProvider implementation.</li>
-     * <li>The provider is loaded using the {@link ServiceLoader#load(Class)} method.</li>
-     * <li>If all the steps above fail, then the rest of the look up is unspecified. That said,
-     *    the recommended behavior is to simply look for some hard-coded platform default Jakarta
-     *    JSON Processing implementation. This phase of the look up is so that a platform can have
+     *    This phase of the look up enables per-JVM override of the JsonProvider implementation.
+     *    The system property path is <em>not</em> cached; the property is re-read on every call
+     *    so that dynamic changes at runtime are always reflected.</li>
+     * <li>The provider is loaded using the
+     *    {@link ServiceLoader#load(Class, ClassLoader)} method with the thread
+     *    context classloader captured at the start of this call.</li>
+     * <li>If all the steps above fail, then the rest of the look up is unspecified. The recommended
+     *    behavior is to look for a hard-coded platform default Jakarta JSON Processing
+     *    implementation. This phase of the look up allows a platform to have
      *    its own Jakarta JSON Processing implementation as the last resort.</li>
      * </ol>
-     * Users are recommended to cache the result of this method.
+     *
      *
      * @see ServiceLoader
      * @return a JSON provider
      */
     public static JsonProvider provider() {
-        LOG.log(Level.FINE, "Checking system property {0}", JSONP_PROVIDER_FACTORY);
-        final String factoryClassName = System.getProperty(JSONP_PROVIDER_FACTORY);
-        if (factoryClassName != null) {
-            JsonProvider provider = newInstance(factoryClassName);
-            LOG.log(Level.FINE, "System property used; returning object [{0}]",
-                    provider.getClass().getName());
-            return provider;
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl == null) {
+            cl = JsonProvider.class.getClassLoader();
         }
 
+        final String factoryClassName = System.getProperty(JSONP_PROVIDER_FACTORY);
+        if (factoryClassName != null) {
+            return newInstance(factoryClassName, cl);
+        }
+
+        synchronized (CLASSLOADER_CACHE) {
+            WeakReference<JsonProvider> ref = CLASSLOADER_CACHE.get(cl);
+            JsonProvider cached = (ref != null) ? ref.get() : null;
+            if (cached != null) {
+                return cached;
+            }
+        }
+        LOG.log(Level.FINE, "Cache miss for classloader [{0}]; starting discovery", cl);
+        JsonProvider discovered = discover(cl);
+        synchronized (CLASSLOADER_CACHE) {
+            WeakReference<JsonProvider> existing = CLASSLOADER_CACHE.putIfAbsent(cl, new WeakReference<>(discovered));
+            return (existing != null && existing.get() != null) ? existing.get() : discovered;
+        }
+    }
+
+    private static JsonProvider discover(ClassLoader cl) {
         LOG.log(Level.FINE, "Checking ServiceLoader");
-        ServiceLoader<JsonProvider> loader = ServiceLoader.load(JsonProvider.class);
+        ServiceLoader<JsonProvider> loader = ServiceLoader.load(JsonProvider.class, cl);
         Iterator<JsonProvider> it = loader.iterator();
         if (it.hasNext()) {
             JsonProvider provider = it.next();
@@ -135,21 +171,23 @@ public abstract class JsonProvider {
             }
         }
 
-        // else no provider found
+        // else no provider found — load the platform default via the spec bundle's own classloader
         LOG.fine("Trying to create the platform default provider");
-        return newInstance(DEFAULT_PROVIDER);
+        ClassLoader specCL = JsonProvider.class.getClassLoader();
+        return newInstance(DEFAULT_PROVIDER, specCL != null ? specCL : cl);
     }
 
     /**
      * Creates a new instance from the specified class
      * @param className name of the class to instantiate
+     * @param cl the classloader to use for resolving the provider class
      * @return the JsonProvider instance
      * @throws JsonException for issues during creation of an instance of the JsonProvider
      */
-    private static JsonProvider newInstance(String className) {
+    private static JsonProvider newInstance(String className, ClassLoader cl) {
         try {
-            @SuppressWarnings({"unchecked"})
-            Class<JsonProvider> clazz = (Class<JsonProvider>) Class.forName(className);
+            @SuppressWarnings("unchecked")
+            Class<JsonProvider> clazz = (Class<JsonProvider>) Class.forName(className, true, cl);
             return clazz.getConstructor().newInstance();
         } catch (ClassNotFoundException x) {
             throw new JsonException(
